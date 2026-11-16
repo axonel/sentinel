@@ -3284,17 +3284,18 @@ pub struct MissionStatusResponse {
 }
 
 struct MissionRunnerGuard {
-    runners: Arc<std::sync::Mutex<std::collections::HashSet<MissionId>>>,
+    runners:
+        Arc<std::sync::Mutex<std::collections::HashMap<MissionId, crate::state::RunnerHandle>>>,
     mission_id: MissionId,
 }
 
 impl Drop for MissionRunnerGuard {
     fn drop(&mut self) {
-        let mut set = match self.runners.lock() {
+        let mut map = match self.runners.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        set.remove(&self.mission_id);
+        map.remove(&self.mission_id);
     }
 }
 
@@ -3304,13 +3305,28 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    if !runners.insert(mission_id) {
+    if let Some(handle) = runners.get_mut(&mission_id) {
+        handle.generation += 1;
+        handle
+            .restart_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.notify.notify_one();
         tracing::info!(
-            "[BackgroundMission] Runner already active for mission {}",
-            mission_id
+            "[BackgroundMission] Runner already active for mission {}; signaled restart/wakeup (gen {})",
+            mission_id,
+            handle.generation
         );
         return;
     }
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = crate::state::RunnerHandle {
+        generation: 1,
+        notify: notify.clone(),
+        restart_requested: restart_requested.clone(),
+    };
+    runners.insert(mission_id, handle);
 
     let guard = MissionRunnerGuard {
         runners: state.active_mission_runners.clone(),
@@ -3318,13 +3334,39 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
     };
 
     let engine = state.mission_engine.clone();
+    let runners_map = state.active_mission_runners.clone();
+    let store = state.store.clone();
+
     tokio::spawn(async move {
         let _guard = guard;
         tracing::info!("[BackgroundMission] Auto-stepping mission {}", mission_id);
         loop {
+            // Check if terminal state was reached durably in storage
+            if let Ok(Some(m)) = store.get_mission(&mission_id).await {
+                if m.state.is_terminal() {
+                    let mut map = match runners_map.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    map.remove(&mission_id);
+                    break;
+                }
+            }
+
             if !engine.is_running(&mission_id).await {
+                let mut map = match runners_map.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    restart_requested.store(false, std::sync::atomic::Ordering::SeqCst);
+                    drop(map);
+                    continue;
+                }
+                map.remove(&mission_id);
                 break;
             }
+
             match engine.step_mission(mission_id).await {
                 Ok(m) => {
                     tracing::info!(
@@ -3333,12 +3375,30 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                         m.state,
                         m.cycle_index
                     );
-                    if m.state.is_terminal()
-                        || m.state == MissionState::AwaitingAcceptance
+                    if m.state.is_terminal() {
+                        let mut map = match runners_map.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        map.remove(&mission_id);
+                        break;
+                    }
+
+                    if m.state == MissionState::AwaitingAcceptance
                         || m.state == MissionState::Accepted
                         || m.state == MissionState::NeedsHuman
                         || m.state == MissionState::Waiting
                     {
+                        let mut map = match runners_map.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                            restart_requested.store(false, std::sync::atomic::Ordering::SeqCst);
+                            drop(map);
+                            continue;
+                        }
+                        map.remove(&mission_id);
                         break;
                     }
                 }
@@ -3348,10 +3408,25 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                         mission_id,
                         e
                     );
+                    let _ = engine
+                        .escalate_human(
+                            &mission_id,
+                            format!("Mission runner stepping error: {}", e),
+                        )
+                        .await;
+                    let mut map = match runners_map.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    map.remove(&mission_id);
                     break;
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(300)) => {}
+                _ = notify.notified() => {}
+            }
         }
     });
 }

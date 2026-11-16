@@ -10,6 +10,14 @@ use crate::terminal::TerminalBuffer;
 use crate::workflow_executor::ServerWorkflowExecutor;
 
 /// Container for shared runtime and persistence resources.
+/// Execution runner coordination handle for an active background task.
+#[derive(Clone)]
+pub struct RunnerHandle {
+    pub generation: u64,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub restart_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<SqliteStore>,
@@ -23,7 +31,7 @@ pub struct AppState {
     pub mission_engine: Arc<plexis_runtime::MissionEngine<SqliteStore>>,
     pub workspace_locks: Arc<crate::workspace_lock::WorkspaceLockManager>,
     pub active_mission_runners:
-        Arc<std::sync::Mutex<std::collections::HashSet<plexis_core::ids::MissionId>>>,
+        Arc<std::sync::Mutex<std::collections::HashMap<plexis_core::ids::MissionId, RunnerHandle>>>,
     pub bind_host: String,
     pub is_loopback: bool,
 }
@@ -60,7 +68,7 @@ impl AppState {
             mission_engine,
             workspace_locks: Arc::new(crate::workspace_lock::WorkspaceLockManager::new()),
             active_mission_runners: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             )),
             bind_host: "127.0.0.1".to_string(),
             is_loopback: true,
@@ -97,7 +105,7 @@ impl AppState {
             mission_engine,
             workspace_locks: Arc::new(crate::workspace_lock::WorkspaceLockManager::new()),
             active_mission_runners: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             )),
             bind_host: "127.0.0.1".to_string(),
             is_loopback: true,
@@ -105,11 +113,11 @@ impl AppState {
     }
 
     pub fn is_mission_runner_active(&self, mission_id: &plexis_core::ids::MissionId) -> bool {
-        let set = match self.active_mission_runners.lock() {
+        let map = match self.active_mission_runners.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        set.contains(mission_id)
+        map.contains_key(mission_id)
     }
 
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {

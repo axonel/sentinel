@@ -3895,6 +3895,56 @@ impl MissionStore for SqliteStore {
         Ok(())
     }
 
+    async fn update_mission_conditional(
+        &self,
+        m: &Mission,
+        expected_state: MissionState,
+    ) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().await;
+        let rows = conn.execute(
+            "UPDATE missions SET
+                workspace_id = ?1,
+                active_workflow_id = ?2,
+                title = ?3,
+                objective = ?4,
+                state = ?5,
+                cycle_index = ?6,
+                budget = ?7,
+                budget_consumed = ?8,
+                health_status = ?9,
+                stopping_condition = ?10,
+                latest_verified_commit = ?11,
+                final_outcome = ?12,
+                escalation_reason = ?13,
+                metadata = ?14,
+                updated_at = ?15
+             WHERE id = ?16 AND state = ?17",
+            params![
+                m.workspace_id.map(|id| id.to_string()),
+                m.active_workflow_id.map(|id| id.to_string()),
+                m.title,
+                m.objective,
+                m.state.as_str(),
+                m.cycle_index,
+                serde_json::to_string(&m.budget)?,
+                serde_json::to_string(&m.budget_consumed)?,
+                serde_json::to_string(&m.health_status)?,
+                serde_json::to_string(&m.stopping_condition)?,
+                m.latest_verified_commit,
+                m.final_outcome
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                m.escalation_reason,
+                serde_json::to_string(&m.metadata)?,
+                m.updated_at.to_rfc3339(),
+                m.id.to_string(),
+                expected_state.as_str(),
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     async fn list_missions(&self) -> Result<Vec<Mission>, StorageError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(

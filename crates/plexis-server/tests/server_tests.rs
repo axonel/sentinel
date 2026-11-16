@@ -4,6 +4,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use std::process::Command;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 use plexis_server::{create_router, AppState};
@@ -2422,10 +2423,557 @@ async fn test_duplicate_execution_prevention_under_concurrency() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|id| **id == mission_id)
+        .filter(|(id, _)| **id == mission_id)
         .count();
     assert_eq!(active_count, 1, "Exactly one runner must be registered");
 
     // Clean up
     let _ = state.mission_engine.pause_mission(&mission_id).await;
+}
+
+#[tokio::test]
+async fn test_concurrent_escalation_resolution_barrier() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+    let app = create_router(state.clone());
+
+    let create_payload = serde_json::json!({
+        "title": "Concurrent Resolution Barrier Mission",
+        "objective": "Verify atomic resolution race between resume and cancel",
+        "stopping_condition": {
+            "required_tests_pass": false,
+            "working_tree_clean": false,
+            "required_commit_exists": false
+        },
+        "auto_start": false
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/missions")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let mission_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mission_id: plexis_core::ids::MissionId =
+        mission_json["id"].as_str().unwrap().parse().unwrap();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/start", mission_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/escalate", mission_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "reason": "Operator decision required" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for the initial runner to shut down after escalation
+    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.is_mission_runner_active(&mission_id) {
+        if std::time::Instant::now() > timeout {
+            panic!("Runner did not terminate after escalation");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Launch two resolution requests simultaneously using a synchronization barrier
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let app1 = app.clone();
+    let barrier1 = barrier.clone();
+    let mid1 = mission_id;
+    let handle1 = tokio::spawn(async move {
+        barrier1.wait().await;
+        app1.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/resolve", mid1))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "decision": "resume" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    });
+
+    let app2 = app.clone();
+    let barrier2 = barrier.clone();
+    let mid2 = mission_id;
+    let handle2 = tokio::spawn(async move {
+        barrier2.wait().await;
+        app2.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/resolve", mid2))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "decision": "cancel" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    });
+
+    let (res1, res2) = tokio::join!(handle1, handle2);
+    let res1 = res1.unwrap();
+    let res2 = res2.unwrap();
+
+    let statuses = [res1.status(), res2.status()];
+    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    let conflict_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::CONFLICT)
+        .count();
+
+    // Exactly one must succeed with 200 OK, and exactly one must return 409 Conflict
+    assert_eq!(ok_count, 1, "Exactly one resolution request must succeed");
+    assert_eq!(
+        conflict_count, 1,
+        "The concurrent resolution request must return 409 Conflict"
+    );
+
+    // Verify persistent state matches the winning decision
+    let persistent_mission = state.store.get_mission(&mission_id).await.unwrap().unwrap();
+    if res1.status() == StatusCode::OK {
+        // "resume" won
+        assert_eq!(
+            persistent_mission.state,
+            plexis_core::state::MissionState::Running
+        );
+        assert!(
+            state.is_mission_runner_active(&mission_id),
+            "Exactly one execution runner must exist when resume wins"
+        );
+        let _ = state.mission_engine.pause_mission(&mission_id).await;
+    } else {
+        // "cancel" won
+        assert_eq!(
+            persistent_mission.state,
+            plexis_core::state::MissionState::Cancelled
+        );
+        assert!(
+            !state.is_mission_runner_active(&mission_id),
+            "No execution runner must exist when cancel wins"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_runner_termination_restart_race_interleaving() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+    let app = create_router(state.clone());
+
+    let create_payload = serde_json::json!({
+        "title": "Runner Interleaving Mission",
+        "objective": "Verify resolution arriving while runner is active continues execution",
+        "stopping_condition": {
+            "required_tests_pass": false,
+            "working_tree_clean": false,
+            "required_commit_exists": false
+        },
+        "auto_start": false
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/missions")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let mission_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mission_id: plexis_core::ids::MissionId =
+        mission_json["id"].as_str().unwrap().parse().unwrap();
+
+    // Start mission: runner is spawned
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/start", mission_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(state.is_mission_runner_active(&mission_id));
+
+    // Escalate to human
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/escalate", mission_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "reason": "Operator verification" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Immediately resolve with "resume" while the runner is active / shutting down
+    // (Without waiting for runner termination, directly forcing the interleaving)
+    let resolve_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/resolve", mission_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "decision": "resume" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_res.status(), StatusCode::OK);
+
+    // Verify the runner continues running and was not lost
+    assert!(
+        state.is_mission_runner_active(&mission_id),
+        "Runner must remain active after resolution during shutdown interleaving"
+    );
+
+    // Verify exactly one runner exists in the active_mission_runners map
+    let runner_count = state
+        .active_mission_runners
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, _)| **id == mission_id)
+        .count();
+    assert_eq!(runner_count, 1, "Exactly one runner must exist");
+
+    // Clean up
+    let _ = state.mission_engine.pause_mission(&mission_id).await;
+}
+
+#[tokio::test]
+async fn test_terminal_mission_does_not_restart_runner() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+
+    let mission = state
+        .mission_engine
+        .create_mission(
+            "Terminal Test Mission",
+            "Verify terminal mission does not restart runner",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Cancel mission directly
+    let _ = state
+        .mission_engine
+        .cancel_mission(&mission.id)
+        .await
+        .unwrap();
+
+    // Calling spawn_mission_runner on a terminal mission must exit immediately
+    plexis_server::spawn_mission_runner(&state, mission.id);
+
+    // Give Tokio task a moment to execute its terminal check
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Must not be registered as active
+    assert!(
+        !state.is_mission_runner_active(&mission.id),
+        "Terminal mission must not keep an active runner"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_identical_resolution_requests() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+    let app = create_router(state.clone());
+
+    let create_payload = serde_json::json!({
+        "title": "Concurrent Resume Mission",
+        "objective": "Verify atomic resolution race between two simultaneous resume requests",
+        "stopping_condition": {
+            "required_tests_pass": false,
+            "working_tree_clean": false,
+            "required_commit_exists": false
+        },
+        "auto_start": false
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/missions")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let mission_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mission_id: plexis_core::ids::MissionId =
+        mission_json["id"].as_str().unwrap().parse().unwrap();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/start", mission_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/escalate", mission_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "reason": "Operator decision required" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.is_mission_runner_active(&mission_id) {
+        if std::time::Instant::now() > timeout {
+            panic!("Runner did not terminate after escalation");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let app1 = app.clone();
+    let barrier1 = barrier.clone();
+    let mid1 = mission_id;
+    let handle1 = tokio::spawn(async move {
+        barrier1.wait().await;
+        app1.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/resolve", mid1))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "decision": "resume" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    });
+
+    let app2 = app.clone();
+    let barrier2 = barrier.clone();
+    let mid2 = mission_id;
+    let handle2 = tokio::spawn(async move {
+        barrier2.wait().await;
+        app2.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/resolve", mid2))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "decision": "resume" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    });
+
+    let (res1, res2) = tokio::join!(handle1, handle2);
+    let res1 = res1.unwrap();
+    let res2 = res2.unwrap();
+
+    let statuses = [res1.status(), res2.status()];
+    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    let conflict_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::CONFLICT)
+        .count();
+
+    assert_eq!(ok_count, 1, "Exactly one resume request must succeed");
+    assert_eq!(
+        conflict_count, 1,
+        "The concurrent duplicate resume request must return 409 Conflict"
+    );
+
+    let persistent_mission = state.store.get_mission(&mission_id).await.unwrap().unwrap();
+    assert_eq!(
+        persistent_mission.state,
+        plexis_core::state::MissionState::Running
+    );
+    assert!(
+        state.is_mission_runner_active(&mission_id),
+        "Exactly one execution runner must exist"
+    );
+
+    let _ = state.mission_engine.pause_mission(&mission_id).await;
+}
+
+struct FailingServerWorkflowExecutor;
+
+#[async_trait::async_trait]
+impl plexis_runtime::mission::WorkflowExecutor for FailingServerWorkflowExecutor {
+    async fn execute_workflow_cycle(
+        &self,
+        _workflow_id: &plexis_core::ids::WorkflowId,
+        _mission_id: &plexis_core::ids::MissionId,
+    ) -> Result<plexis_runtime::mission::WorkflowExecutionSummary, plexis_runtime::RuntimeError>
+    {
+        Err(plexis_runtime::RuntimeError::Execution(
+            "Workflow cycle failed hard".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn test_server_workflow_execution_error_leaves_needs_human_not_running() {
+    let store = Arc::new(SqliteStore::open_in_memory().expect("open sqlite in-memory"));
+    let mut state = AppState::with_store(store.clone());
+    state.mission_engine = Arc::new(
+        plexis_runtime::MissionEngine::new(store.clone())
+            .with_workflow_executor(Arc::new(FailingServerWorkflowExecutor)),
+    );
+    let app = create_router(state.clone());
+
+    let create_payload = serde_json::json!({
+        "title": "Failing Runner Mission",
+        "objective": "Verify background runner failure escalates to NeedsHuman and terminates",
+        "stopping_condition": {
+            "required_tests_pass": false,
+            "working_tree_clean": false,
+            "required_commit_exists": false
+        },
+        "auto_start": false
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/missions")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let mission_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mission_id: plexis_core::ids::MissionId =
+        mission_json["id"].as_str().unwrap().parse().unwrap();
+
+    // Start mission: spawns runner
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/missions/{}/start", mission_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for the runner task to encounter the executor failure and terminate
+    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.is_mission_runner_active(&mission_id) {
+        if std::time::Instant::now() > timeout {
+            panic!("Runner did not terminate after workflow execution failure");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Verify mission state in store is NeedsHuman (not Running)
+    let persistent_mission = state.store.get_mission(&mission_id).await.unwrap().unwrap();
+    assert_eq!(
+        persistent_mission.state,
+        plexis_core::state::MissionState::NeedsHuman,
+        "Mission must be escalated to NeedsHuman on execution failure"
+    );
+    assert!(
+        persistent_mission
+            .escalation_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("Workflow cycle failed hard"),
+        "Escalation reason must record the underlying failure"
+    );
+
+    // Verify engine running state is false
+    assert!(!state.mission_engine.is_running(&mission_id).await);
+
+    // Verify GET status endpoint reports is_running = false and state = needs_human
+    let status_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/missions/{}/status", mission_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(status_json["is_running"], false);
+    assert_eq!(status_json["mission"]["state"], "needs_human");
 }
