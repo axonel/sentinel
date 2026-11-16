@@ -11,9 +11,10 @@ use crate::workflow_executor::ServerWorkflowExecutor;
 
 /// Container for shared runtime and persistence resources.
 /// Execution runner coordination handle for an active background task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RunnerHandle {
-    pub generation: u64,
+    pub runner_id: u64,
+    pub restart_generation: u64,
     pub notify: Arc<tokio::sync::Notify>,
     pub restart_requested: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -118,6 +119,42 @@ impl AppState {
             Err(p) => p.into_inner(),
         };
         map.contains_key(mission_id)
+    }
+
+    pub fn get_mission_runner_handle(
+        &self,
+        mission_id: &plexis_core::ids::MissionId,
+    ) -> Option<RunnerHandle> {
+        let map = match self.active_mission_runners.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.get(mission_id).cloned()
+    }
+
+    pub fn remove_runner_from_map_if_owner(
+        map: &mut std::collections::HashMap<plexis_core::ids::MissionId, RunnerHandle>,
+        mission_id: &plexis_core::ids::MissionId,
+        runner_id: u64,
+    ) -> bool {
+        if map.get(mission_id).map(|h| h.runner_id) == Some(runner_id) {
+            map.remove(mission_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_mission_runner_if_owner(
+        &self,
+        mission_id: &plexis_core::ids::MissionId,
+        runner_id: u64,
+    ) -> bool {
+        let mut map = match self.active_mission_runners.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        Self::remove_runner_from_map_if_owner(&mut map, mission_id, runner_id)
     }
 
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {

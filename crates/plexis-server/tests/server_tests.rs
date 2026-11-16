@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use plexis_server::{create_router, AppState};
+use plexis_server::{create_router, AppState, MissionRunnerGuard, RunnerHandle};
 use plexis_storage::{MissionStore, SqliteStore};
 
 #[tokio::test]
@@ -2684,6 +2684,26 @@ async fn test_runner_termination_restart_race_interleaving() {
         .count();
     assert_eq!(runner_count, 1, "Exactly one runner must exist");
 
+    // Verify subsequent mission progress occurs: cycle execution progresses autonomously
+    let progress_timeout = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut progressed = false;
+    while std::time::Instant::now() < progress_timeout {
+        if let Ok(Some(m)) = state.store.get_mission(&mission_id).await {
+            if m.active_workflow_id.is_some()
+                || m.budget_consumed.total_executions > 0
+                || m.cycle_index > 0
+            {
+                progressed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert!(
+        progressed,
+        "Subsequent mission progress was not observed after restart resolution"
+    );
+
     // Clean up
     let _ = state.mission_engine.pause_mission(&mission_id).await;
 }
@@ -2976,4 +2996,238 @@ async fn test_server_workflow_execution_error_leaves_needs_human_not_running() {
             .unwrap();
     assert_eq!(status_json["is_running"], false);
     assert_eq!(status_json["mission"]["state"], "needs_human");
+}
+
+#[tokio::test]
+async fn test_stale_runner_guard_cannot_remove_newer_runner() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+    let mission_id = plexis_core::ids::MissionId::new();
+
+    // 1. Registers runner A.
+    let notify_a = Arc::new(tokio::sync::Notify::new());
+    let restart_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle_a = RunnerHandle {
+        runner_id: 101,
+        restart_generation: 1,
+        notify: notify_a,
+        restart_requested: restart_a,
+    };
+    {
+        let mut runners = state.active_mission_runners.lock().unwrap();
+        runners.insert(mission_id, handle_a);
+    }
+    assert!(state.is_mission_runner_active(&mission_id));
+
+    // 2. Creates A's guard.
+    let guard_a = MissionRunnerGuard {
+        runners: state.active_mission_runners.clone(),
+        mission_id,
+        runner_id: 101,
+    };
+
+    // 3. Removes A's registration.
+    {
+        let mut runners = state.active_mission_runners.lock().unwrap();
+        let removed = AppState::remove_runner_from_map_if_owner(&mut runners, &mission_id, 101);
+        assert!(removed, "A's registration must be removed");
+        assert!(!runners.contains_key(&mission_id));
+    }
+
+    // 4. Registers runner B for the same mission.
+    let notify_b = Arc::new(tokio::sync::Notify::new());
+    let restart_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle_b = RunnerHandle {
+        runner_id: 102,
+        restart_generation: 1,
+        notify: notify_b,
+        restart_requested: restart_b,
+    };
+    {
+        let mut runners = state.active_mission_runners.lock().unwrap();
+        runners.insert(mission_id, handle_b);
+    }
+    assert!(state.is_mission_runner_active(&mission_id));
+
+    // 5. Drops A's guard.
+    drop(guard_a);
+
+    // 6. Asserts B remains registered.
+    {
+        let runners = state.active_mission_runners.lock().unwrap();
+        let current = runners
+            .get(&mission_id)
+            .expect("Runner B must remain registered in map after stale guard drop");
+        assert_eq!(
+            current.runner_id, 102,
+            "Active runner must still be runner B (id 102)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_restart_signaling_does_not_change_runner_ownership() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+
+    let mission = state
+        .mission_engine
+        .create_mission(
+            "Ownership Stability Test",
+            "Verify restart signaling increments generation without changing runner_id",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Start mission (spawns initial runner)
+    let _ = state
+        .mission_engine
+        .start_mission(mission.id)
+        .await
+        .unwrap();
+    plexis_server::spawn_mission_runner(&state, mission.id);
+
+    let initial_handle = state
+        .get_mission_runner_handle(&mission.id)
+        .expect("Runner must be registered");
+    let initial_runner_id = initial_handle.runner_id;
+    assert_eq!(initial_handle.restart_generation, 1);
+    assert!(!initial_handle
+        .restart_requested
+        .load(std::sync::atomic::Ordering::SeqCst));
+
+    // Signal restart
+    plexis_server::spawn_mission_runner(&state, mission.id);
+
+    let updated_handle = state
+        .get_mission_runner_handle(&mission.id)
+        .expect("Runner must remain registered");
+    assert_eq!(
+        updated_handle.runner_id, initial_runner_id,
+        "Runner identity must be unchanged"
+    );
+    assert_eq!(
+        updated_handle.restart_generation, 2,
+        "Restart generation must be incremented"
+    );
+    assert!(
+        updated_handle
+            .restart_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "Restart requested flag must be set"
+    );
+
+    // Clean up
+    let _ = state.mission_engine.pause_mission(&mission.id).await;
+}
+
+#[tokio::test]
+async fn test_normal_runner_termination_removes_own_registration() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+
+    let mission = state
+        .mission_engine
+        .create_mission(
+            "Termination Cleanup Test",
+            "Verify runner cleanly removes its own registration upon cancellation",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = state
+        .mission_engine
+        .start_mission(mission.id)
+        .await
+        .unwrap();
+    plexis_server::spawn_mission_runner(&state, mission.id);
+    assert!(state.is_mission_runner_active(&mission.id));
+
+    // Cancel mission directly
+    let _ = state
+        .mission_engine
+        .cancel_mission(&mission.id)
+        .await
+        .unwrap();
+
+    // Wait deterministically for runner to observe terminal state and unregister
+    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.is_mission_runner_active(&mission.id) {
+        if std::time::Instant::now() > timeout {
+            panic!("Runner did not clean up its registration within timeout");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        !state.is_mission_runner_active(&mission.id),
+        "Runner must be unregistered after termination"
+    );
+    assert!(
+        state.get_mission_runner_handle(&mission.id).is_none(),
+        "Handle must be removed from active runners map"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_spawn_requests_produce_at_most_one_registered_runner() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite in-memory");
+    let state = AppState::new(store);
+
+    let mission = state
+        .mission_engine
+        .create_mission(
+            "Concurrent Spawn Mission",
+            "Verify concurrent spawn requests register exactly one runner",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = state
+        .mission_engine
+        .start_mission(mission.id)
+        .await
+        .unwrap();
+    let mission_id = mission.id;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(10));
+    let mut handles = Vec::new();
+
+    for _ in 0..10 {
+        let s = state.clone();
+        let b = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            b.wait().await;
+            plexis_server::spawn_mission_runner(&s, mission_id);
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    {
+        let runners = state.active_mission_runners.lock().unwrap();
+        let runner_count = runners.iter().filter(|(id, _)| **id == mission_id).count();
+        assert_eq!(
+            runner_count, 1,
+            "Exactly one runner must be registered for the mission under concurrent spawn requests"
+        );
+
+        let handle = runners.get(&mission_id).unwrap();
+        // 1 initial spawn + 9 restart generation increments = 10 total generation
+        assert_eq!(handle.restart_generation, 10);
+    }
+
+    // Clean up
+    let _ = state.mission_engine.pause_mission(&mission_id).await;
 }

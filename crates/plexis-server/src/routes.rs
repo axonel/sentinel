@@ -3283,10 +3283,13 @@ pub struct MissionStatusResponse {
     pub cycles_count: usize,
 }
 
-struct MissionRunnerGuard {
-    runners:
+static NEXT_RUNNER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub struct MissionRunnerGuard {
+    pub runners:
         Arc<std::sync::Mutex<std::collections::HashMap<MissionId, crate::state::RunnerHandle>>>,
-    mission_id: MissionId,
+    pub mission_id: MissionId,
+    pub runner_id: u64,
 }
 
 impl Drop for MissionRunnerGuard {
@@ -3295,7 +3298,19 @@ impl Drop for MissionRunnerGuard {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        map.remove(&self.mission_id);
+        if AppState::remove_runner_from_map_if_owner(&mut map, &self.mission_id, self.runner_id) {
+            tracing::info!(
+                "[BackgroundMission] Runner {} for mission {} unregistered on drop",
+                self.runner_id,
+                self.mission_id
+            );
+        } else {
+            tracing::debug!(
+                "[BackgroundMission] Stale runner guard for runner {} on mission {} ignored on drop",
+                self.runner_id,
+                self.mission_id
+            );
+        }
     }
 }
 
@@ -3306,23 +3321,26 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
     };
 
     if let Some(handle) = runners.get_mut(&mission_id) {
-        handle.generation += 1;
+        handle.restart_generation += 1;
         handle
             .restart_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
         handle.notify.notify_one();
         tracing::info!(
-            "[BackgroundMission] Runner already active for mission {}; signaled restart/wakeup (gen {})",
+            "[BackgroundMission] Runner already active for mission {} (runner_id {}); signaled restart/wakeup (gen {})",
             mission_id,
-            handle.generation
+            handle.runner_id,
+            handle.restart_generation
         );
         return;
     }
 
+    let runner_id = NEXT_RUNNER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let notify = Arc::new(tokio::sync::Notify::new());
     let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = crate::state::RunnerHandle {
-        generation: 1,
+        runner_id,
+        restart_generation: 1,
         notify: notify.clone(),
         restart_requested: restart_requested.clone(),
     };
@@ -3331,6 +3349,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
     let guard = MissionRunnerGuard {
         runners: state.active_mission_runners.clone(),
         mission_id,
+        runner_id,
     };
 
     let engine = state.mission_engine.clone();
@@ -3339,7 +3358,11 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
 
     tokio::spawn(async move {
         let _guard = guard;
-        tracing::info!("[BackgroundMission] Auto-stepping mission {}", mission_id);
+        tracing::info!(
+            "[BackgroundMission] Auto-stepping mission {} (runner_id {})",
+            mission_id,
+            runner_id
+        );
         loop {
             // Check if terminal state was reached durably in storage
             if let Ok(Some(m)) = store.get_mission(&mission_id).await {
@@ -3348,7 +3371,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    map.remove(&mission_id);
+                    AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
                     break;
                 }
             }
@@ -3363,7 +3386,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                     drop(map);
                     continue;
                 }
-                map.remove(&mission_id);
+                AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
                 break;
             }
 
@@ -3380,7 +3403,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
-                        map.remove(&mission_id);
+                        AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
                         break;
                     }
 
@@ -3398,7 +3421,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                             drop(map);
                             continue;
                         }
-                        map.remove(&mission_id);
+                        AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
                         break;
                     }
                 }
@@ -3418,7 +3441,7 @@ pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    map.remove(&mission_id);
+                    AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
                     break;
                 }
             }
