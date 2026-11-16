@@ -277,6 +277,12 @@ where
 
         self.store.update_mission(&mission).await?;
 
+        if mission.state.is_terminal() || mission.state == MissionState::NeedsHuman {
+            self.running_missions.lock().await.remove(mission_id);
+        } else {
+            self.running_missions.lock().await.insert(*mission_id);
+        }
+
         self.emit_mission_event(
             *mission_id,
             "human_resolution",
@@ -391,6 +397,9 @@ where
             mission.active_workflow_id = Some(wf_id);
             wf_id
         };
+
+        // Durably record active workflow and state before running cycle
+        self.store.update_mission(&mission).await?;
 
         // 4.5. Execute workflow cycle via WorkflowExecutor if registered
         let execution_summary = if let Some(ref executor) = self.workflow_executor {
