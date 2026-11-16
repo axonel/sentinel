@@ -9,8 +9,8 @@ use plexis_core::ids::{
 };
 use plexis_core::{
     Agent, AgentMessage, ApprovalRecord, Command, CommandState, Event, Execution, Lease,
-    MemoryRecord, MemoryScope, Mission, MissionCheckpoint, MissionCycle, PlanningRecord,
-    RecoveryRecord, Session, Task, TaskGraph, Verification, Workflow, Workspace,
+    MemoryRecord, MemoryScope, Mission, MissionCheckpoint, MissionCycle, MissionState,
+    PlanningRecord, RecoveryRecord, Session, Task, TaskGraph, Verification, Workflow, Workspace,
 };
 
 use crate::error::StorageError;
@@ -291,6 +291,11 @@ pub trait MissionStore: Send + Sync {
     async fn create_mission(&self, mission: &Mission) -> Result<(), StorageError>;
     async fn get_mission(&self, id: &MissionId) -> Result<Option<Mission>, StorageError>;
     async fn update_mission(&self, mission: &Mission) -> Result<(), StorageError>;
+    async fn update_mission_conditional(
+        &self,
+        mission: &Mission,
+        expected_state: MissionState,
+    ) -> Result<bool, StorageError>;
     async fn list_missions(&self) -> Result<Vec<Mission>, StorageError>;
     async fn list_missions_by_workspace(
         &self,

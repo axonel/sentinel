@@ -10,6 +10,15 @@ use crate::terminal::TerminalBuffer;
 use crate::workflow_executor::ServerWorkflowExecutor;
 
 /// Container for shared runtime and persistence resources.
+/// Execution runner coordination handle for an active background task.
+#[derive(Clone, Debug)]
+pub struct RunnerHandle {
+    pub runner_id: u64,
+    pub restart_generation: u64,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub restart_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<SqliteStore>,
@@ -22,6 +31,8 @@ pub struct AppState {
     pub backend_registry: Arc<BackendRegistry>,
     pub mission_engine: Arc<plexis_runtime::MissionEngine<SqliteStore>>,
     pub workspace_locks: Arc<crate::workspace_lock::WorkspaceLockManager>,
+    pub active_mission_runners:
+        Arc<std::sync::Mutex<std::collections::HashMap<plexis_core::ids::MissionId, RunnerHandle>>>,
     pub bind_host: String,
     pub is_loopback: bool,
 }
@@ -57,6 +68,9 @@ impl AppState {
             backend_registry: Arc::new(BackendRegistry::with_defaults()),
             mission_engine,
             workspace_locks: Arc::new(crate::workspace_lock::WorkspaceLockManager::new()),
+            active_mission_runners: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             bind_host: "127.0.0.1".to_string(),
             is_loopback: true,
         }
@@ -91,9 +105,56 @@ impl AppState {
             backend_registry: Arc::new(BackendRegistry::with_defaults()),
             mission_engine,
             workspace_locks: Arc::new(crate::workspace_lock::WorkspaceLockManager::new()),
+            active_mission_runners: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             bind_host: "127.0.0.1".to_string(),
             is_loopback: true,
         }
+    }
+
+    pub fn is_mission_runner_active(&self, mission_id: &plexis_core::ids::MissionId) -> bool {
+        let map = match self.active_mission_runners.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.contains_key(mission_id)
+    }
+
+    pub fn get_mission_runner_handle(
+        &self,
+        mission_id: &plexis_core::ids::MissionId,
+    ) -> Option<RunnerHandle> {
+        let map = match self.active_mission_runners.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.get(mission_id).cloned()
+    }
+
+    pub fn remove_runner_from_map_if_owner(
+        map: &mut std::collections::HashMap<plexis_core::ids::MissionId, RunnerHandle>,
+        mission_id: &plexis_core::ids::MissionId,
+        runner_id: u64,
+    ) -> bool {
+        if map.get(mission_id).map(|h| h.runner_id) == Some(runner_id) {
+            map.remove(mission_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_mission_runner_if_owner(
+        &self,
+        mission_id: &plexis_core::ids::MissionId,
+        runner_id: u64,
+    ) -> bool {
+        let mut map = match self.active_mission_runners.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        Self::remove_runner_from_map_if_owner(&mut map, mission_id, runner_id)
     }
 
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {

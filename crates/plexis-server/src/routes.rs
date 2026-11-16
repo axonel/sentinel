@@ -3283,6 +3283,177 @@ pub struct MissionStatusResponse {
     pub cycles_count: usize,
 }
 
+static NEXT_RUNNER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub struct MissionRunnerGuard {
+    pub runners:
+        Arc<std::sync::Mutex<std::collections::HashMap<MissionId, crate::state::RunnerHandle>>>,
+    pub mission_id: MissionId,
+    pub runner_id: u64,
+}
+
+impl Drop for MissionRunnerGuard {
+    fn drop(&mut self) {
+        let mut map = match self.runners.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if AppState::remove_runner_from_map_if_owner(&mut map, &self.mission_id, self.runner_id) {
+            tracing::info!(
+                "[BackgroundMission] Runner {} for mission {} unregistered on drop",
+                self.runner_id,
+                self.mission_id
+            );
+        } else {
+            tracing::debug!(
+                "[BackgroundMission] Stale runner guard for runner {} on mission {} ignored on drop",
+                self.runner_id,
+                self.mission_id
+            );
+        }
+    }
+}
+
+pub fn spawn_mission_runner(state: &AppState, mission_id: MissionId) {
+    let mut runners = match state.active_mission_runners.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(handle) = runners.get_mut(&mission_id) {
+        handle.restart_generation += 1;
+        handle
+            .restart_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.notify.notify_one();
+        tracing::info!(
+            "[BackgroundMission] Runner already active for mission {} (runner_id {}); signaled restart/wakeup (gen {})",
+            mission_id,
+            handle.runner_id,
+            handle.restart_generation
+        );
+        return;
+    }
+
+    let runner_id = NEXT_RUNNER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = crate::state::RunnerHandle {
+        runner_id,
+        restart_generation: 1,
+        notify: notify.clone(),
+        restart_requested: restart_requested.clone(),
+    };
+    runners.insert(mission_id, handle);
+
+    let guard = MissionRunnerGuard {
+        runners: state.active_mission_runners.clone(),
+        mission_id,
+        runner_id,
+    };
+
+    let engine = state.mission_engine.clone();
+    let runners_map = state.active_mission_runners.clone();
+    let store = state.store.clone();
+
+    tokio::spawn(async move {
+        let _guard = guard;
+        tracing::info!(
+            "[BackgroundMission] Auto-stepping mission {} (runner_id {})",
+            mission_id,
+            runner_id
+        );
+        loop {
+            // Check if terminal state was reached durably in storage
+            if let Ok(Some(m)) = store.get_mission(&mission_id).await {
+                if m.state.is_terminal() {
+                    let mut map = match runners_map.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
+                    break;
+                }
+            }
+
+            if !engine.is_running(&mission_id).await {
+                let mut map = match runners_map.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    restart_requested.store(false, std::sync::atomic::Ordering::SeqCst);
+                    drop(map);
+                    continue;
+                }
+                AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
+                break;
+            }
+
+            match engine.step_mission(mission_id).await {
+                Ok(m) => {
+                    tracing::info!(
+                        "[BackgroundMission] Mission {} reached state {}, cycle {}",
+                        mission_id,
+                        m.state,
+                        m.cycle_index
+                    );
+                    if m.state.is_terminal() {
+                        let mut map = match runners_map.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
+                        break;
+                    }
+
+                    if m.state == MissionState::AwaitingAcceptance
+                        || m.state == MissionState::Accepted
+                        || m.state == MissionState::NeedsHuman
+                        || m.state == MissionState::Waiting
+                    {
+                        let mut map = match runners_map.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                            restart_requested.store(false, std::sync::atomic::Ordering::SeqCst);
+                            drop(map);
+                            continue;
+                        }
+                        AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[BackgroundMission] Mission {} stepping error: {}",
+                        mission_id,
+                        e
+                    );
+                    let _ = engine
+                        .escalate_human(
+                            &mission_id,
+                            format!("Mission runner stepping error: {}", e),
+                        )
+                        .await;
+                    let mut map = match runners_map.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    AppState::remove_runner_from_map_if_owner(&mut map, &mission_id, runner_id);
+                    break;
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(300)) => {}
+                _ = notify.notified() => {}
+            }
+        }
+    });
+}
+
 async fn create_mission(
     State(state): State<AppState>,
     Json(req): Json<CreateMissionRequest>,
@@ -3345,33 +3516,7 @@ async fn create_mission(
             .await
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let engine = state.mission_engine.clone();
-        let m_id = mission.id;
-        tokio::spawn(async move {
-            tracing::info!("[BackgroundMission] Auto-stepping mission {}", m_id);
-            loop {
-                if !engine.is_running(&m_id).await {
-                    break;
-                }
-                match engine.step_mission(m_id).await {
-                    Ok(m) => {
-                        if m.state.is_terminal()
-                            || m.state == MissionState::AwaitingAcceptance
-                            || m.state == MissionState::Accepted
-                            || m.state == MissionState::NeedsHuman
-                            || m.state == MissionState::Waiting
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[BackgroundMission] Step error for {}: {}", m_id, e);
-                        break;
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            }
-        });
+        spawn_mission_runner(&state, mission.id);
     }
 
     Ok((StatusCode::CREATED, Json(mission)))
@@ -3426,33 +3571,7 @@ async fn start_mission(
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
 
-    let engine = state.mission_engine.clone();
-    let m_id = mission.id;
-    tokio::spawn(async move {
-        tracing::info!("[BackgroundMission] Auto-stepping mission {}", m_id);
-        loop {
-            if !engine.is_running(&m_id).await {
-                break;
-            }
-            match engine.step_mission(m_id).await {
-                Ok(m) => {
-                    if m.state.is_terminal()
-                        || m.state == MissionState::AwaitingAcceptance
-                        || m.state == MissionState::Accepted
-                        || m.state == MissionState::NeedsHuman
-                        || m.state == MissionState::Waiting
-                    {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("[BackgroundMission] Step error for {}: {}", m_id, e);
-                    break;
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        }
-    });
+    spawn_mission_runner(&state, mission.id);
 
     Ok(Json(mission))
 }
@@ -3500,33 +3619,7 @@ async fn resume_mission(
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
 
-    let engine = state.mission_engine.clone();
-    let m_id = mission.id;
-    tokio::spawn(async move {
-        tracing::info!("[BackgroundMission] Auto-stepping resumed mission {}", m_id);
-        loop {
-            if !engine.is_running(&m_id).await {
-                break;
-            }
-            match engine.step_mission(m_id).await {
-                Ok(m) => {
-                    if m.state.is_terminal()
-                        || m.state == MissionState::AwaitingAcceptance
-                        || m.state == MissionState::Accepted
-                        || m.state == MissionState::NeedsHuman
-                        || m.state == MissionState::Waiting
-                    {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("[BackgroundMission] Step error for {}: {}", m_id, e);
-                    break;
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        }
-    });
+    spawn_mission_runner(&state, mission.id);
 
     Ok(Json(mission))
 }
@@ -3712,6 +3805,10 @@ async fn resolve_mission(
             plexis_runtime::RuntimeError::Conflict(msg) => ApiError::new(StatusCode::CONFLICT, msg),
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
+
+    if !mission.state.is_terminal() && mission.state != MissionState::NeedsHuman {
+        spawn_mission_runner(&state, mission.id);
+    }
 
     Ok(Json(mission))
 }
@@ -4725,49 +4822,7 @@ async fn run_mission_background(
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
 
-    let engine = state.mission_engine.clone();
-    tokio::spawn(async move {
-        tracing::info!(
-            "[BackgroundMission] Starting autonomous run for mission {}",
-            mission_id
-        );
-        loop {
-            if !engine.is_running(&mission_id).await {
-                break;
-            }
-            match engine.step_mission(mission_id).await {
-                Ok(m) => {
-                    tracing::info!(
-                        "[BackgroundMission] Mission {} reached state {}, cycle {}",
-                        mission_id,
-                        m.state,
-                        m.cycle_index
-                    );
-                    if m.state.is_terminal()
-                        || m.state == MissionState::AwaitingAcceptance
-                        || m.state == MissionState::Accepted
-                        || m.state == MissionState::NeedsHuman
-                        || m.state == MissionState::Waiting
-                    {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[BackgroundMission] Mission {} stepping error: {}",
-                        mission_id,
-                        e
-                    );
-                    break;
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        }
-        tracing::info!(
-            "[BackgroundMission] Completed autonomous run for mission {}",
-            mission_id
-        );
-    });
+    spawn_mission_runner(&state, mission.id);
 
     Ok(Json(mission))
 }

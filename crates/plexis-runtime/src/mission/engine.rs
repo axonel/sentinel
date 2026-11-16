@@ -275,7 +275,23 @@ where
             }
         }
 
-        self.store.update_mission(&mission).await?;
+        let updated = self
+            .store
+            .update_mission_conditional(&mission, MissionState::NeedsHuman)
+            .await?;
+
+        if !updated {
+            return Err(RuntimeError::Conflict(format!(
+                "Mission '{}' is no longer in NeedsHuman state",
+                mission_id
+            )));
+        }
+
+        if mission.state.is_terminal() || mission.state == MissionState::NeedsHuman {
+            self.running_missions.lock().await.remove(mission_id);
+        } else {
+            self.running_missions.lock().await.insert(*mission_id);
+        }
 
         self.emit_mission_event(
             *mission_id,
@@ -392,25 +408,49 @@ where
             wf_id
         };
 
+        // Durably record active workflow and state before running cycle
+        self.store.update_mission(&mission).await?;
+
         // 4.5. Execute workflow cycle via WorkflowExecutor if registered
         let execution_summary = if let Some(ref executor) = self.workflow_executor {
-            let summary = executor
+            match executor
                 .execute_workflow_cycle(&workflow_id, &mission_id)
-                .await?;
-            info!(
-                "[MissionEngine] Mission {} executed workflow cycle: {} tasks executed, {} completed, {} failed",
-                mission_id,
-                summary.executed_tasks_count,
-                summary.completed_tasks_count,
-                summary.failed_tasks_count
-            );
-            if summary.executed_tasks_count > 0 {
-                for _ in 0..summary.executed_tasks_count {
-                    tracker.record_execution();
+                .await
+            {
+                Ok(summary) => {
+                    info!(
+                        "[MissionEngine] Mission {} executed workflow cycle: {} tasks executed, {} completed, {} failed",
+                        mission_id,
+                        summary.executed_tasks_count,
+                        summary.completed_tasks_count,
+                        summary.failed_tasks_count
+                    );
+                    if summary.executed_tasks_count > 0 {
+                        for _ in 0..summary.executed_tasks_count {
+                            tracker.record_execution();
+                        }
+                        mission.budget_consumed.total_executions =
+                            tracker.consumed.total_executions;
+                    }
+                    Some(summary)
                 }
-                mission.budget_consumed.total_executions = tracker.consumed.total_executions;
+                Err(err) => {
+                    warn!(
+                        "[MissionEngine] Workflow cycle execution failed for mission {}: {}. Escalating to NeedsHuman.",
+                        mission_id, err
+                    );
+                    self.escalate_human(
+                        &mission_id,
+                        format!("Workflow cycle execution failed: {}", err),
+                    )
+                    .await?;
+                    return self
+                        .store
+                        .get_mission(&mission_id)
+                        .await?
+                        .ok_or_else(|| RuntimeError::NotFound("Mission not found".into()));
+                }
             }
-            Some(summary)
         } else {
             tracker.record_execution();
             mission.budget_consumed.total_executions = tracker.consumed.total_executions;

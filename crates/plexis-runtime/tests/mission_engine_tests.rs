@@ -238,3 +238,274 @@ async fn test_reconciler_discovers_active_missions_on_startup() {
         .collect();
     assert_eq!(reconciled_events.len(), 1);
 }
+
+#[tokio::test]
+async fn test_escalation_resolution_lifecycle_running_missions() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let engine = MissionEngine::new(store.clone());
+
+    let mission = engine
+        .create_mission(
+            "Escalation Test Mission",
+            "Verify running state transitions across escalation and resolution",
+            None,
+            Some(MissionBudget::default()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 1. Start mission -> Planning -> running_missions contains id
+    let started = engine.start_mission(mission.id).await.unwrap();
+    assert_eq!(started.state, MissionState::Planning);
+    assert!(engine.is_running(&mission.id).await);
+
+    // 2. Escalate to human -> NeedsHuman -> running_missions removed
+    let escalated = engine
+        .escalate_human(&mission.id, "Need operator clarification")
+        .await
+        .unwrap();
+    assert_eq!(escalated.state, MissionState::NeedsHuman);
+    assert!(!engine.is_running(&mission.id).await);
+
+    // 3. Resolve with resume -> Running -> running_missions restored
+    let resumed = engine
+        .resolve_escalation(&mission.id, "resume")
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, MissionState::Running);
+    assert!(
+        engine.is_running(&mission.id).await,
+        "Mission should be marked running after resume resolution"
+    );
+
+    // 4. Escalate to human again -> NeedsHuman -> running_missions removed
+    let escalated2 = engine
+        .escalate_human(&mission.id, "Need second operator clarification")
+        .await
+        .unwrap();
+    assert_eq!(escalated2.state, MissionState::NeedsHuman);
+    assert!(!engine.is_running(&mission.id).await);
+
+    // 5. Resolve with replan -> Replanning -> running_missions restored
+    let replanned = engine
+        .resolve_escalation(&mission.id, "replan")
+        .await
+        .unwrap();
+    assert_eq!(replanned.state, MissionState::Replanning);
+    assert!(
+        engine.is_running(&mission.id).await,
+        "Mission should be marked running after replan resolution"
+    );
+
+    // 6. Escalate to human again -> NeedsHuman -> running_missions removed
+    let escalated3 = engine
+        .escalate_human(&mission.id, "Unrecoverable issue")
+        .await
+        .unwrap();
+    assert_eq!(escalated3.state, MissionState::NeedsHuman);
+    assert!(!engine.is_running(&mission.id).await);
+
+    // 7. Resolve with cancel -> Cancelled -> running_missions remains not running
+    let cancelled = engine
+        .resolve_escalation(&mission.id, "cancel")
+        .await
+        .unwrap();
+    assert_eq!(cancelled.state, MissionState::Cancelled);
+    assert!(
+        !engine.is_running(&mission.id).await,
+        "Mission should NOT be running after cancel resolution"
+    );
+}
+
+#[tokio::test]
+async fn test_escalation_resolution_rejects_non_needs_human() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let engine = MissionEngine::new(store.clone());
+
+    let mission = engine
+        .create_mission(
+            "Conflict Test Mission",
+            "Verify resolution is rejected when not in NeedsHuman",
+            None,
+            Some(MissionBudget::default()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Mission in Created state -> resolve_escalation should fail with Conflict
+    let err = engine.resolve_escalation(&mission.id, "resume").await;
+    assert!(matches!(
+        err,
+        Err(plexis_runtime::RuntimeError::Conflict(_))
+    ));
+
+    // Start mission (Planning state) -> resolve_escalation should fail with Conflict
+    let _started = engine.start_mission(mission.id).await.unwrap();
+    let err = engine.resolve_escalation(&mission.id, "resume").await;
+    assert!(matches!(
+        err,
+        Err(plexis_runtime::RuntimeError::Conflict(_))
+    ));
+
+    // Escalate to human -> NeedsHuman
+    let _ = engine.escalate_human(&mission.id, "help").await.unwrap();
+
+    // First resolve succeeds
+    let _ = engine
+        .resolve_escalation(&mission.id, "resume")
+        .await
+        .unwrap();
+
+    // Second resolve on the same mission (now in Running state) must fail with Conflict
+    let err = engine.resolve_escalation(&mission.id, "resume").await;
+    assert!(matches!(
+        err,
+        Err(plexis_runtime::RuntimeError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_escalation_resolution_allows_subsequent_step_execution() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let engine = MissionEngine::new(store.clone());
+
+    let mission = engine
+        .create_mission(
+            "Step Execution Test Mission",
+            "Verify step execution proceeds after escalation resolution",
+            None,
+            Some(MissionBudget::default()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _started = engine.start_mission(mission.id).await.unwrap();
+    let _escalated = engine.escalate_human(&mission.id, "Stalled").await.unwrap();
+    assert!(!engine.is_running(&mission.id).await);
+
+    // In NeedsHuman, step_mission returns without progressing
+    let no_step = engine.step_mission(mission.id).await.unwrap();
+    assert_eq!(no_step.state, MissionState::NeedsHuman);
+
+    // Resolve with resume
+    let resumed = engine
+        .resolve_escalation(&mission.id, "resume")
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, MissionState::Running);
+    assert!(engine.is_running(&mission.id).await);
+
+    // Now step_mission can execute
+    let stepped = engine.step_mission(mission.id).await.unwrap();
+    assert_ne!(stepped.state, MissionState::NeedsHuman);
+    assert!(engine.is_running(&mission.id).await);
+}
+
+#[tokio::test]
+async fn test_conditional_mission_update_rejects_stale_state() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let engine = MissionEngine::new(store.clone());
+
+    let mission = engine
+        .create_mission(
+            "Conditional Update Mission",
+            "Verify CAS state update reject on stale state",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut modified = mission.clone();
+    modified.state = MissionState::Running;
+
+    // Expected state is NeedsHuman, but actual state is Created -> must return false
+    let cas_res = store
+        .update_mission_conditional(&modified, MissionState::NeedsHuman)
+        .await
+        .unwrap();
+    assert!(!cas_res);
+
+    // Verify stored state remains Created
+    let current = store.get_mission(&mission.id).await.unwrap().unwrap();
+    assert_eq!(current.state, MissionState::Created);
+
+    // Expected state is Created -> must return true
+    let cas_ok = store
+        .update_mission_conditional(&modified, MissionState::Created)
+        .await
+        .unwrap();
+    assert!(cas_ok);
+
+    // Verify stored state is now Running
+    let current_updated = store.get_mission(&mission.id).await.unwrap().unwrap();
+    assert_eq!(current_updated.state, MissionState::Running);
+}
+
+struct FailingWorkflowExecutor;
+
+#[async_trait::async_trait]
+impl plexis_runtime::mission::WorkflowExecutor for FailingWorkflowExecutor {
+    async fn execute_workflow_cycle(
+        &self,
+        _workflow_id: &plexis_core::ids::WorkflowId,
+        _mission_id: &plexis_core::ids::MissionId,
+    ) -> Result<plexis_runtime::mission::WorkflowExecutionSummary, plexis_runtime::RuntimeError>
+    {
+        Err(plexis_runtime::RuntimeError::Execution(
+            "Simulated infrastructure failure during cycle execution".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn test_workflow_execution_error_escalates_to_needs_human_without_stalling() {
+    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let engine =
+        MissionEngine::new(store.clone()).with_workflow_executor(Arc::new(FailingWorkflowExecutor));
+
+    let mission = engine
+        .create_mission(
+            "Fault Injection Mission",
+            "Verify failure handling does not leave state stalled",
+            None,
+            Some(MissionBudget::default()),
+            Some(StoppingCondition::default()),
+        )
+        .await
+        .unwrap();
+
+    let _started = engine.start_mission(mission.id).await.unwrap();
+    assert!(engine.is_running(&mission.id).await);
+
+    // Step mission triggers failing executor
+    let stepped = engine.step_mission(mission.id).await.unwrap();
+
+    // Verify mission escalated to NeedsHuman
+    assert_eq!(stepped.state, MissionState::NeedsHuman);
+    assert!(stepped
+        .escalation_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("Simulated infrastructure failure"));
+
+    // Verify engine running state is false
+    assert!(!engine.is_running(&mission.id).await);
+
+    // Verify persistent state in store is NeedsHuman (not Running)
+    let persisted = store.get_mission(&mission.id).await.unwrap().unwrap();
+    assert_eq!(persisted.state, MissionState::NeedsHuman);
+    assert_eq!(
+        persisted.health_status,
+        plexis_core::mission::MissionHealth::Escalated
+    );
+    assert!(persisted
+        .escalation_reason
+        .as_deref()
+        .unwrap_or("")
+        .contains("Simulated infrastructure failure"));
+}
