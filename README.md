@@ -10,12 +10,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/axonel/sentinel/actions/workflows/ci.yml"><img src="https://github.com/axonel/sentinel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/axonel/sentinel/releases/tag/v0.1.1"><img src="https://img.shields.io/badge/release-v0.1.1-brightgreen.svg" alt="Release"></a>
+  <a href="https://github.com/axonel/sentinel/actions/workflows/ci.yml"><img src="https://github.com/axonel/sentinel/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/axonel/sentinel/releases"><img src="https://img.shields.io/github/v/release/axonel/sentinel?display_name=tag" alt="Latest release"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust"></a>
-  <a href="https://img.shields.io/github/stars/axonel/sentinel"><img src="https://img.shields.io/github/stars/axonel/sentinel?style=flat&logo=github" alt="Stars"></a>
+  <a href="https://github.com/axonel/sentinel/stargazers"><img src="https://img.shields.io/github/stars/axonel/sentinel?style=flat&logo=github" alt="Stars"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License"></a>
   <a href="docs/limitations.md"><img src="https://img.shields.io/badge/platform-Linux%20x86__64-blue.svg" alt="Platform"></a>
+</p>
+
+<p align="center">
+  <img src="docs/readme-assets/hero/dashboard-hero.png" alt="Sentinel Mission Control dashboard showing supervised agent execution and review" width="100%">
 </p>
 
 <p align="center">
